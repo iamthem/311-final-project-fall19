@@ -1,0 +1,8 @@
+# Project Description 
+In this study, we obtained data on research collaboration between universities in Sub-Saharan Africa through CMU libraries. The dataset contains information on collaboration at the institution level and the country level. The network generated from that contains information on collaboration at the institution level, subsetted to only include Sub-Saharan African countries. 
+
+We have data on 984 institutions, with a network that is quite sparse. The Jaccard Indices are as follows: *INCLUDE JACCARD INDEX TABLE HERE* The original adjacency matrix representing the institutions' collaboration was weighted, such that each unit represented the number of times two given institutions had collaborated. For modeling purposes this matrix was de-weighted such that a 1 represented if two institutions collaborated at all, and a 0 represented no collaboration. The model we selected to answer our question was a Stochastic Actor Oriented Model (SAOM). 
+
+SAOM is able to measure changes in networks over time, providing insight on how ties change using a Markov assumption- the current state of the network only depends on the previous state. Here, each timestep was the duration of a single year, and we subsetted the data to only include information on ties since 2010, giving us 8 timesteps measured. Since researchers don't make decisions on who to collaborate with the next year only based on who they collaborated with this year, it is wise to take the results of the model with a grain of salt, though the results are still likely quite accurate because time-based dependence is still folded into the model.
+
+`311-final-out` Shows the final output from the model

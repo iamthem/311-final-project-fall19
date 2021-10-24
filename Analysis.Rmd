@@ -1,0 +1,591 @@
+---
+title: "Sub-Saharan Africa Papers"
+author: "Filipp Shelobolin, Leandro Lopez, Sana Lakdawala, Mary Bollinger"
+date: "11/20/2019"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+```{r setup, include = F}
+rm(list = ls())
+knitr::opts_chunk$set(echo = TRUE, warning = F, message = F)
+load_packages <- c("tidyverse", "igraph", "rvest", "isnar", "RSiena")
+lapply(load_packages, require, character.only = T)
+ggplot_theme <-  theme_light() +
+  theme(axis.text = element_text(size = 10, color = "gray20"),
+        text = element_text(size = 11, face = "bold", color = "mistyrose4"),
+        panel.background = element_rect(fill = "white", color = "midnightblue", size = 0.5),
+        panel.grid.major = element_line(color = "grey69", size = 0.2),
+        panel.grid.minor = element_line(color = "white"),
+        legend.background = element_rect(fill = "white", color = "midnightblue", size = 0.1)) 
+set.seed(69)
+```
+
+# Data Wrangling {.tabset}
+
+## Load data
+
+```{r}
+library(readr)
+papers <- read_csv("20190301_WoS_cleancountry_all_ID_36311.csv")
+```
+
+## Paper indices & functions
+
+We need a couple functions to efficiently parse data
+
+```{r}
+set.seed(69)
+
+paper_indices <- which(complete.cases(papers$Author))
+# add last index for loop iterations
+paper_indices <- append(paper_indices, nrow(papers) + 1)
+# create pairwise paper_indices data frame for parallelization 
+# subtract 1 from end to make it inclusive
+paper_indices_matrix <- as.matrix(data.frame(start = paper_indices[1 : (length(paper_indices) - 1)], 
+                               end = paper_indices[2 : length(paper_indices)] - 1))
+
+# paper_counter: adds to A counters to adjacency list A based on factor colName interested in
+# (country or affiliation_noauthor), and start and end index (inclusive) of that encompass one paper. 
+# Assumes `papers` is in scope
+# THIS IS AN ITERATIVE METHOD -- TOO SLOW. not used.
+paper_counter <- function(start_index, end_index, nodeIDs, A, colName) {
+  papers_xs <- papers[[colName]][start_index : end_index] %>% unique # unique just in case repeat
+  for (x in papers_xs) {
+    x_index <- which(nodeIDs == x)
+    for (y in papers_xs) {
+      y_index <- which(nodeIDs == y)
+      A[x_index, y_index] = A[x_index, y_index] + 1
+    }
+  }
+  return(A)
+}
+
+# returns `colName` in each paper
+# indices is a vector due to parallelization
+paper_divider <- function(indices, nodeIDs, colName) {
+  start_index <- indices[1]
+  end_index <- indices[2]
+  divided_papers <- papers[[colName]][start_index : end_index] %>%
+    unique
+  # return nodeID indices:
+  lapply(divided_papers, function(x) {which(nodeIDs == x)}) %>%
+    do.call(rbind, .) %>%
+    c() %>%
+    return
+}
+
+# updates adjacency matrix with break indices (of papers), and column which we want to break up.
+# Assumes that papers is in scope.
+# ITERATIVE -- TOO SLOW. adjacency_adder_parallel used instead
+adjacency_adder <- function(indices, nodeIDs, A, colName) {
+  for (ii in 1:(length(indices) - 1)) {
+    start_index <- indices[ii]
+    end_index <- indices[ii + 1]
+    # subtract 1 from end_index since paper_counter assumes it is inclusive.
+    A <- paper_counter(start_index, end_index - 1, nodeIDs, A, colName)
+  }
+  # remove diagonals
+  diag(A) <- rep(0, length(nodeIDs))
+  return(A)
+}
+
+# tries to parallelize adjacency_adder
+adjacency_adder_parallel <- function(indices_matrix, nodeIDs, A, colName) {
+  divided_papers <- apply(indices_matrix, 1, paper_divider, nodeIDs, colName)
+  # we now have indices of the matrix of interacting `colName` in papers in a list format
+  # two possible approaches: 1) create a matrix for each paper and add them together
+  # or 2) a for loop.
+  # since we parallelized getting the indices, we've already saved a lot of time, so
+  # we are going to go with a for loop here (matrices will be too big)
+  for (paper in divided_papers) {
+    for (index1 in paper) {
+      for (index2 in paper) {
+        if (index1 != index2) {
+          A[index1, index2] = A[index1, index2] + 1
+        }
+      }
+    }
+  }
+  return(A)
+}
+
+# only extracts network of papers that occured in a years that in the vector `years`
+# will be necessary for SAOM later
+adjacency_adder_parallel_by_year <- function(indices_matrix, nodeIDs, A, colName, years) {
+  # all years defined by the papers in indices matrix
+  paper_years <- papers$PubYear[indices_matrix[,1]]
+  w <- which(paper_years %in% years)
+  # all indices with years in given `years`
+  indices_matrix <- indices_matrix[w,]
+  return(adjacency_adder_parallel(indices_matrix, nodeIDs, A, colName))
+}
+```
+
+
+## Country Matrices & Node IDs
+
+Each node is a country. We create a vector of all countries. Index in vector is node ID in matrix.
+
+```{r}
+# countries sorted to be standard
+countries <- sort(unique(papers$Country))
+# weighted adjacency matrix for countries
+A.countries <- matrix(0, nrow = length(countries), ncol = length(countries))
+
+A.countries <- adjacency_adder_parallel(paper_indices_matrix, countries, A.countries, "Country")
+G.countries <- graph_from_adjacency_matrix(A.countries, mode = "undirected", weighted="Connections")
+```
+
+## Affiliate NLP
+
+```{r}
+affiliates <- sort(unique(papers$Affiliation_NoAuthor))
+# TOO MANY, need to divide by overall institution (do later)
+length(affiliates)/nrow(papers) # 76% are unique values!
+cat("same univ:", affiliates[5 : 14], "\n") # departments under same university are separate affiliates
+affiliate_cutter <- function(affiliate) {
+  regex <- regexpr("*,", affiliate, useBytes = T)
+  affiliate_cut <- substr(affiliate, 1, regex[1] - 1)
+  return(affiliate_cut)
+}
+
+papers$Affiliation_NoAuthor <- lapply(papers$Affiliation_NoAuthor, affiliate_cutter) %>%
+  do.call(rbind, .)
+affiliates <- sort(unique(papers$Affiliation_NoAuthor))
+
+length(affiliates)/nrow(papers) # 26% unique values, much much better
+cat("misclassified:", affiliates[501 : 503], "\n") # example of misclassifications
+cat("ambiguous:", affiliates[440 : 442], "\n") # example of amiguously correct classification
+```
+
+With inspection of the affiliates we find that same-institution affiliates have in common everything before the comma. Thus the heuristic we can use for classifying two affiliates is say they are in the same institution if theyA clthough this heuristic will probably create a couple false-positives (classification of two affiliates as from the same institution when in fact they are different, from similar affiliate names) and false-negatives (classifications of two affiliates as from different institutions because their names were written differently), it's simple and accurate enough.
+
+## Affiliate Matrix and Node IDs
+
+Each node is an affiliate (institution). We create a vector of all affiliates. Index in vector is node ID in matrix.
+
+```{r}
+set.seed(69)
+# hard to say whether different branches of univ in diff countries should count as same institution
+A.affiliates <- matrix(0, nrow = length(affiliates), ncol = length(affiliates)) # affiliate weighted adjacency matrix
+A.affiliates <- adjacency_adder_parallel(paper_indices_matrix, affiliates, A.affiliates, "Affiliation_NoAuthor")
+G.affiliates <- graph_from_adjacency_matrix(A.affiliates, mode = "undirected")
+```
+
+## Add countries attribute to affiliates
+
+```{r}
+#getting the country vector for affiliates
+countries <- c()
+for (ii in 1:length(affiliates)) {
+  paper <- papers %>% filter(Affiliation_NoAuthor == affiliates[ii])
+  country <- head(paper,1)$Country
+  countries[ii] <- country
+}
+
+#setting vertex attribute country to our countries vector
+V(G.affiliates)$country <- countries
+
+```
+
+## Add region attribute to affiliates
+
+```{r}
+
+# setting vertex attribute region to our graph, yes if subSaharan, no if not
+# need to get Sub-Saharan African Countries. We get this from wikipedia
+page <- read_html("https://en.wikipedia.org/wiki/Sub-Saharan_Africa")
+tbls <- page %>% html_nodes("table") %>% html_table(fill=TRUE)
+SubSaharan <- tbls[[1]]$Country %>%
+  c()
+V(G.affiliates)$region <- NA
+for (ii in 1:length(affiliates)) {
+  if (V(G.affiliates)$country[ii] %in% SubSaharan) {
+    V(G.affiliates)$region[ii] <- "Yes"
+  } else {
+   V(G.affiliates)$region[ii] <- "No"
+  }
+}
+```
+
+# Plots {.tabset}
+
+## Countries
+
+```{r}
+# Kamada-Kawai layout
+l <- layout_with_kk(G.countries)
+# stretch the graph
+l <- norm_coords(l, ymin = -1.1, ymax=1.2, xmin=-3, xmax=2.1)
+# size by degree
+V(G.countries)$size <- degree(G.countries, normalized = F)/6
+# width by number of connections
+E(G.countries)$width <- E(G.countries)$Connections/10
+
+# need to get Sub-Saharan African Countries. We get this from wikipedia
+page <- read_html("https://en.wikipedia.org/wiki/Sub-Saharan_Africa")
+tbls <- page %>% html_nodes("table") %>% html_table(fill=TRUE)
+SubSaharan <- tbls[[1]]$Country %>%
+  c()
+V(G.countries)$location <- NA
+for (ii in 1:length(countries)) {
+  if (countries[ii] %in% SubSaharan) {
+    V(G.countries)$location[ii] <- "Yes"
+  } else {
+    V(G.countries)$location[ii] <- "No"
+  }
+}
+plot(G.countries, vertex.label=NA, rescale=F, layout = l, vertex.color = c("orange","lightblue")[factor(V(G.countries)$location)])
+legend('topleft', legend = levels(factor(V(G.countries)$location)), fill = c("orange", "lightblue"), title = "In Sub-Saharan Africa?")
+```
+
+## Affiliates
+
+```{r}
+# too clustered for now
+#V(G.affiliates)$size <- degree(G.countries, normalized = F)/6
+#plot(G.affiliates, vertex.label=NA) 
+```
+
+# Graph descriptions {.tabset}
+
+## Density
+
+Here we calculate the density for our two graphs, one with affiliates as nodes and one with countires.
+
+```{r}
+# country density
+rowSums(A.countries>0) %>%
+  sum %>%
+  `/`(length(countries)*(length(countries)-1)/2)
+# affiliate density
+rowSums(A.affiliates>0) %>%
+  sum %>%
+  `/`(length(affiliates)*(length(affiliates)-1)/2)
+```
+
+We see that the graph relating countries that have collaborated is very dense, 0.7, indicating that many countries work with many other countries.
+For the graph relating affiliates, it is much less dense, only 0.025. This means that each affliate works with a small number of other affiliates, and these small clusters are not very connected to one another.
+
+## E-I index
+
+We are also interested in seeing how the Sub-Saharan countries collaborate with countries outside of the region, so we calculate the E-I index for our graph relating countries that have appeared on the same paper, with groups being defined as whether or not the country is in sub-saharan Africa. 
+
+```{r}
+ei(G.countries, "location")
+ei(G.affiliates, "region")
+```
+
+We find that we have a slightly negative E-I index for countries. This implies that the countries tend to stay within their own region for collaboratioin, but since it is closer to 0 than -1, it is safe to say there is still cross-region collboration in the data. We find an even more negative E-I index for region, meaning that to a higer degree than countries, contributing institutions collaborate more often with other institutions in their region than outside of their region.
+
+## Transitivity
+
+To better understand the collaborations between institutions, we are interested in calculating the trasitivity of our graph relating the affiliations of the collaborators as well as the average clustering coefficient for the graph. 
+
+```{r}
+transitivity(G.affiliates,"global")
+(1/(length(transitivity(G.affiliates,"local")[which(!is.na(transitivity(G.affiliates,"local")))]))) * sum(transitivity(G.affiliates,"local"), na.rm = TRUE)
+```
+
+We see the avgerage local culstering coefficient is fairly high at 0.79. This tells us that most vertices have a high local clustering coefficient. Since this number is larger than our measure of transitivity, 0.46, this test us that our nodes with high degrees have lower local clustering coefficients than most other nodes. In the context of our data, this means that there are more small clusters of institutions that collaborate a lot with each other than institutions that collaborate with lots of other institutions being in clusters.
+
+```{r}
+transitivity(G.countries,"global")
+(1/(length(transitivity(G.countries,"local")[which(!is.na(transitivity(G.countries,"local")))]))) * sum(transitivity(G.countries,"local"), na.rm = TRUE)
+```
+
+We see the avgerage local culstering coefficient is high at 0.82. This tells us that most vertices have a high local clustering coefficient. Since this number is larger than our measure of transitivity, 0.67, this test us that our nodes with high degrees have lower local clustering coefficients than most other nodes. In the context of our data, this means that ther are many small clusters of countries that work together a lot, with the countries that collaborate more with lots of other clusters have slightly smaller clustering coefficients.
+
+## Centrality {.tabset}
+
+
+### Network level
+First we will calculate network level statistics to understand the networks as a whole
+```{r}
+#For the affiliates graph
+print("Affiliates Graph")
+centr_degree(G.affiliates)$centralization
+centr_clo(G.affiliates, mode = "all")$centralization
+centr_betw(G.affiliates, directed = FALSE)$centralization
+centr_eigen(G.affiliates, directed = FALSE)$centralization
+
+#For the countries graph
+print("Countries Graph")
+centr_degree(G.countries)$centralization
+centr_clo(G.countries, mode = "all")$centralization
+centr_betw(G.countries, directed = FALSE)$centralization
+centr_eigen(G.countries, directed = FALSE)$centralization
+```
+
+For the Affiliates Graph:
+We see that the degree centeralization of the network is fairly high, 0.63, indicating that overall the affiliates in the data tend to collaborate with a fair number of other affiliates in general. The closeness centralization is very low, 0.00053, indicating that in our overall network, the institutions "far apart" which makes sense because we saw in our transitivity calculations the institutions are highly clustered with the institutions that are well connected being less clustered (maybe indicating few connections between the smaller clusters). The betweeness centrality is also low, 0.156, probably for similar reasons. The eigenvector centrality is fairly high for the affiliates, 0.9817, meaning that institutions that collaborate with other well connected institutions.
+For the Countries Graph:
+We see that the degree centeralization of the network is fairly high, 0.55, indicating that overall the countries in the data tend to collaborate with a fair number of other countries. The closeness centralization is fairly low, 0.205, meaing that in our overall network the countries are not close to one another indicating that there may indicate that countries are clustered with few connections between the clusters. The betweeness centrality is also low, 0.0637, probably for similar reasons. The eigenvector centrality is fairly high for the countries, 0.5115, meaning that institutions that collaborate with lots of other countries tend to collaborate with other well connected countries. This makes sense since we say in our graph that the US, England, and South Africa interact with lots of countries, and quite a bit with each other.
+
+### Finding the most central nodes
+
+We first look at our affiliates graph
+```{r}
+deg_nodes <- degree(G.affiliates)
+most_degree <- which(deg_nodes == max(deg_nodes))
+betwn_nodes <- betweenness(G.affiliates)
+most_btwn <- which(betwn_nodes == max(betwn_nodes))
+close_nodes <- closeness(G.affiliates)
+most_close <- which(close_nodes == max(close_nodes))
+
+```
+
+```{r}
+affiliates[most_degree]
+affiliates[most_btwn]
+affiliates[most_close]
+```
+We see that for all measures of centrality, the University of Cape Town is the most centeral node. This means it has the highest degree, lies on the shortest path between institutions the most often, and is most closely connected to the other insitutions.
+
+We then look at our countries graph
+```{r}
+deg_nodes <- degree(G.countries)
+most_degree <- which(deg_nodes == max(deg_nodes))
+betwn_nodes <- betweenness(G.countries)
+most_btwn <- which(betwn_nodes == max(betwn_nodes))
+close_nodes <- closeness(G.countries)
+most_close <- which(close_nodes == max(close_nodes))
+
+```
+
+```{r}
+countries[most_degree]
+countries[most_btwn]
+countries[most_close]
+```
+Unsurprisingly we get South Africa, which is where the University of Cape Town is.
+
+## Degree Distribution
+
+```{r}
+### Filipp to populate this segment
+```
+
+
+## Density over Years
+
+```{r}
+yearlygraphs = c()
+densities = c()
+for (i in seq(2010, 2018)) {
+  a = matrix(0, nrow = length(affiliates), ncol = length(affiliates))
+  a = adjacency_adder_parallel_by_year(paper_indices_matrix, affiliates, a, "Affiliation_NoAuthor", c(i))
+  g = graph_from_adjacency_matrix(a)
+  yearlygraphs[i - 2009] = g
+  densities[i - 2009] = edge_density(g)
+}
+densityDf = data.frame(year = seq(2010, 2018), density = densities)
+ggplot(data = densityDf) + 
+  geom_line(aes(x = year, y = density)) + 
+  labs(x = "Year", y = "Density", title = "Graph Density per Year") +
+  ggplot_theme 
+```
+
+Observe from the above graph that the density of the graph increases for each year since 2010 (our timeframe of interest here is since 2010). In this window, density starts at an almost-miniscule level and grows almost exponentially to 0.004. While this is still quite a sparse network, observe that the latge number of actors in consideration would induce such sparseness, though we still observe a heavy increase in collaboration over time if observing raw data.  
+
+
+## Number of Papers per Tie
+
+# Country Level
+
+```{r}
+adjacency_adder_parallel_by_country = function(indices_matrix, nodeIDs, A, colName, countries) {
+  # all years defined by the papers in indices matrix
+  paper_years <- papers$PubYear[indices_matrix[,1]]
+  w <- which(paper_years %in% countries)
+  # all indices with years in given `years`
+  indices_matrix <- indices_matrix[w,]
+  return(adjacency_adder_parallel(indices_matrix, nodeIDs, A, colName))
+}
+
+```
+
+# Affiliate Level
+
+```{r}
+
+```
+
+
+# SAOM
+
+## Is SAOM appropriate?
+
+There is quite a bit of change per year, this could be too much for an SAOM to handle. Consider the histogram below, we see around 25\% increase in papers per year. 
+
+```{r}
+paper_years <- papers$PubYear
+paper_years <- paper_years[complete.cases(paper_years)]
+ggplot(data.frame(paper_years)) + 
+  geom_histogram(aes(x = paper_years), binwidth = 1) +
+  ggplot_theme +
+  labs(x = "Publication year", title = "Histogram of paper publication year") +
+  scale_x_continuous(breaks = seq(from = 1990, to = 2020, by = 5)) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+## Jaccard Index
+
+We consider calculating the Jaccard index for multiple years. We consider two later years where the change is large (2015/2016) & two earlier years where the change is small (2010/2011). The result: not good. Jaccard index is way too low (we want >.3).
+
+```{r}
+A.affiliates.2000 <- matrix(0, nrow = length(affiliates), ncol = length(affiliates)) # affiliate weighted adjacency matrix
+A.affiliates.2000 <- adjacency_adder_parallel_by_year(paper_indices_matrix, affiliates, A.affiliates.2000, "Affiliation_NoAuthor", c(2000))
+
+A.affiliates.2001 <- matrix(0, nrow = length(affiliates), ncol = length(affiliates)) # affiliate weighted adjacency matrix
+A.affiliates.2001 <- adjacency_adder_parallel_by_year(paper_indices_matrix, affiliates, A.affiliates.2001, "Affiliation_NoAuthor", c(2001))
+
+A.affiliates.2002 <- matrix(0, nrow = length(affiliates), ncol = length(affiliates)) # affiliate weighted adjacency matrix
+A.affiliates.2002 <- adjacency_adder_parallel_by_year(paper_indices_matrix, affiliates, A.affiliates.2001, "Affiliation_NoAuthor", c(2001))
+
+A.affiliates.2004 <- matrix(0, nrow = length(affiliates), ncol = length(affiliates)) # affiliate weighted adjacency matrix
+A.affiliates.2004 <- adjacency_adder_parallel_by_year(paper_indices_matrix, affiliates, A.affiliates.2004, "Affiliation_NoAuthor", c(2004))
+
+A.affiliates.2005 <- matrix(0, nrow = length(affiliates), ncol = length(affiliates)) # affiliate weighted adjacency matrix
+A.affiliates.2005 <- adjacency_adder_parallel_by_year(paper_indices_matrix, affiliates, A.affiliates.2005, "Affiliation_NoAuthor", c(2005))
+
+A.affiliates.2006 <- matrix(0, nrow = length(affiliates), ncol = length(affiliates)) # affiliate weighted adjacency matrix
+A.affiliates.2006 <- adjacency_adder_parallel_by_year(paper_indices_matrix, affiliates, A.affiliates.2006, "Affiliation_NoAuthor", c(2006))
+
+A.affiliates.2010 <- matrix(0, nrow = length(affiliates), ncol = length(affiliates)) # affiliate weighted adjacency matrix
+A.affiliates.2010 <- adjacency_adder_parallel_by_year(paper_indices_matrix, affiliates, A.affiliates.2010, "Affiliation_NoAuthor", c(2010))
+
+A.affiliates.2011 <- matrix(0, nrow = length(affiliates), ncol = length(affiliates)) # affiliate weighted adjacency matrix
+A.affiliates.2011 <- adjacency_adder_parallel_by_year(paper_indices_matrix, affiliates, A.affiliates.2011, "Affiliation_NoAuthor", c(2011))
+
+A.affiliates.2015 <- matrix(0, nrow = length(affiliates), ncol = length(affiliates)) # affiliate weighted adjacency matrix
+A.affiliates.2015 <- adjacency_adder_parallel_by_year(paper_indices_matrix, affiliates, A.affiliates.2015, "Affiliation_NoAuthor", c(2015))
+
+A.affiliates.2016 <- matrix(0, nrow = length(affiliates), ncol = length(affiliates)) # affiliate weighted adjacency matrix
+A.affiliates.2016 <- adjacency_adder_parallel_by_year(paper_indices_matrix, affiliates, A.affiliates.2016, "Affiliation_NoAuthor", c(2016))
+
+calculate_jaccard <- function(A1, A2) {
+  in_common <- sum(A1 > 0 & A2 > 0) # ties in both
+  A1_ties <- sum(A1 > 0) # ties in A1
+  A2_ties <- sum(A2 > 0) # ties in A2
+  single_ties <- A1_ties + A2_ties - in_common # total ties in only one of {A1, A2}
+  return(in_common/single_ties)
+}
+#calculate_jaccard(A.affiliates.2010, A.affiliates.2011)
+```
+
+
+## RSiena 
+
+```{r}
+SubSaharanCountries = which(V(G.affiliates)$region == "Yes")
+
+A.affiliates.2000.SubSaharan = A.affiliates.2000[SubSaharanCountries, SubSaharanCountries]
+
+A.affiliates.2001.SubSaharan = A.affiliates.2001[SubSaharanCountries, SubSaharanCountries]
+
+A.affiliates.2002.SubSaharan = A.affiliates.2002[SubSaharanCountries, SubSaharanCountries]
+
+A.affiliates.2004.SubSaharan = A.affiliates.2004[SubSaharanCountries, SubSaharanCountries]
+
+A.affiliates.2005.SubSaharan = A.affiliates.2005[SubSaharanCountries, SubSaharanCountries]
+
+A.affiliates.2006.SubSaharan = A.affiliates.2006[SubSaharanCountries, SubSaharanCountries]
+
+A.affiliates.2010.SubSaharan = A.affiliates.2010[SubSaharanCountries, SubSaharanCountries]
+#plot(network(A.affiliates.2010.SubSaharan))
+#sum(A.affiliates.2010.SubSaharan)
+
+A.affiliates.2011.SubSaharan = A.affiliates.2011[SubSaharanCountries, SubSaharanCountries]
+#plot(network(A.affiliates.2011.SubSaharan))
+
+A.affiliates.2015.SubSaharan = A.affiliates.2015[SubSaharanCountries, SubSaharanCountries]
+#plot(network(A.affiliates.2015.SubSaharan))
+
+A.affiliates.2016.SubSaharan = A.affiliates.2016[SubSaharanCountries, SubSaharanCountries]
+#plot(network(A.affiliates.2016.SubSaharan))
+
+```
+
+```{r}
+removeWeights = function(x) {
+  ifelse(x>0, 1, 0)
+}
+
+A.affiliates.2000.SubSaharan.unweighted = removeWeights(A.affiliates.2000.SubSaharan)
+A.affiliates.2001.SubSaharan.unweighted = removeWeights(A.affiliates.2001.SubSaharan)
+A.affiliates.2002.SubSaharan.unweighted = removeWeights(A.affiliates.2002.SubSaharan)
+
+A.affiliates.2004.SubSaharan.unweighted = removeWeights(A.affiliates.2004.SubSaharan)
+A.affiliates.2005.SubSaharan.unweighted = removeWeights(A.affiliates.2005.SubSaharan)
+A.affiliates.2006.SubSaharan.unweighted = removeWeights(A.affiliates.2006.SubSaharan)
+
+A.affiliates.2010.SubSaharan.unweighted = removeWeights(A.affiliates.2010.SubSaharan)
+A.affiliates.2011.SubSaharan.unweighted = removeWeights(A.affiliates.2011.SubSaharan)
+A.affiliates.2015.SubSaharan.unweighted = removeWeights(A.affiliates.2015.SubSaharan)
+A.affiliates.2016.SubSaharan.unweighted = removeWeights(A.affiliates.2016.SubSaharan)
+
+## Additional cleaning here?
+```
+
+```{r}
+# Bind waves together
+# We can't compute any more than two waves for anything greater than early 2000's 
+# However early years are very sparse and are not changing quickly enough for model to 
+# give meaningful params 
+collaboration <- array(c(A.affiliates.2010.SubSaharan.unweighted,
+                         A.affiliates.2011.SubSaharan.unweighted),
+                       dim = c(984, 984, 2))
+## Generate Rsiena net object. This step takes forever in our net
+net.fun <- sienaDependent(collaboration)
+# Here we could add other covariates, see docs for sienaDependent
+# load data and print report 
+data <- sienaDataCreate(net.fun)
+# Some random effects for completeness
+myeff <- getEffects( data )
+
+#myeff <- includeEffects(myeff, transTies, cycle3)
+
+#print01Report(data, model="4 waves")
+```
+
+Since we have an undirected network, we have to adjust the model type to more accurately reflect the dynamic of our network. We choose the Pairwise conjunctive model in which a pair of actors is chosen and reconsider whether a tie will exist between them; the tie will exist if the both agree, and it will not exist if at least one does not choose for it. This assumption most closely resembles research collaboration. 
+```{r}
+# Initiliaze different algorithms to atteempt to converge 
+#This initialization is to 
+v = c(5)
+names(v) <- c('net.fun')
+
+# trivial model 
+myalgorithmeasy <- sienaAlgorithmCreate(projname = '311-final', lessMem = T, cond = F)
+
+# Attempt with M2 model (epoch error)
+myalgorithm <- sienaAlgorithmCreate(projname = '311-final', lessMem = T, cond = F, modelType = v)
+
+# Tweaking phase 2 of the algo model (epoch error)
+myalgorithm1 <- sienaAlgorithmCreate(projname = '311-final', lessMem = T, cond = F, nsub=1, n2start=1000)
+
+# Tweaking firstg of the algo model (epoch error)
+myalgorithm2 <- sienaAlgorithmCreate(projname = '311-final', lessMem = T, cond = F, firstg = 0.01)
+
+# Trying large n3 
+myalgorithm3 <- sienaAlgorithmCreate(projname = '311-final', lessMem = T, cond = F, n3 = 2000)
+
+# fit model with trivial algo to roughtly approximate params  
+ans <- siena07( myalgorithmeasy, data = data, effects = myeff, returnDeps = T)
+
+# Here we can insert any of the more complicated algos 
+ans1 <- siena07( myalgorithm, data = data, effects = myeff, prevAns = ans, returnDeps = T)
+ans2 <- siena07( myalgorithm2, data = data, effects = myeff, prevAns = ans1)
+
+#Goodness of fit 
+gofi <- sienaGOF(ans1, IndegreeDistribution, verbose = T, join = T, varName="net.fun")
+plot(gofi)
+```
+
+
+
+[Methods Section] In this study, we obtained data on research collaboration between universities in Sub-Saharan Africa through CMU libraries. The dataset contains information on collaboration at the institution level and the country level. The network generated from that contains information on collaboration at the institution level, subsetted to only include Sub-Saharan African countries. We have data on 984 institutions, with a network that is quite sparse. The Jaccard Indices are as follows: *INCLUDE JACCARD INDEX TABLE HERE* The original adjacency matrix representing the institutions' collaboration was weighted, such that each unit represented the number of times two given institutions had collaborated. For modeling purposes this matrix was de-weighted such that a 1 represented if two institutions collaborated at all, and a 0 represented no collaboration. The model we selected to answer our question was a Stochastic Actor Oriented Model (SAOM). SAOM is able to measure changes in networks over time, providing insight on how ties change using a Markov assumption- the current state of the network only depends on the previous state. Here, each timestep was the duration of a single year, and we subsetted the data to only include information on ties since 2010, giving us 8 timesteps measured. Since researchers don't make decisions on who to collaborate with the next year only based on who they collaborated with this year, it is wise to take the results of the model with a grain of salt, though the results are still likely quite accurate because time-based dependence is still folded into the model.
